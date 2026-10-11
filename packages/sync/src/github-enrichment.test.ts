@@ -35,6 +35,9 @@ function makeSupabase(opts: {
   candidates: Candidate[];
   stored: Record<string, unknown> | null;
   hasCheckedAt?: boolean;
+  readError?: unknown;
+  updateError?: unknown;
+  markCheckedError?: unknown;
 }): SupabaseHarness {
   const updates: Record<string, unknown>[] = [];
   const selectorCalls: { orders: [string, unknown][]; limit: number | null } = {
@@ -46,6 +49,7 @@ function makeSupabase(opts: {
     from: () => {
       let mode: 'probe' | 'candidates' | 'stored' | 'update' = 'candidates';
       let payload: Record<string, unknown> | null = null;
+      let updateKind: 'markChecked' | 'server' = 'server';
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const chain: any = {
@@ -62,8 +66,14 @@ function makeSupabase(opts: {
         },
         not: () => chain,
         or: () => chain,
-        eq: () => chain,
-        in: () => chain,
+        eq: () => {
+          if (mode === 'update') updateKind = 'server';
+          return chain;
+        },
+        in: () => {
+          if (mode === 'update') updateKind = 'markChecked';
+          return chain;
+        },
         order: (col: string, o: unknown) => {
           if (mode === 'candidates') selectorCalls.orders.push([col, o]);
           return chain;
@@ -72,7 +82,7 @@ function makeSupabase(opts: {
           if (mode === 'candidates') selectorCalls.limit = n;
           return chain;
         },
-        maybeSingle: async () => ({ data: opts.stored, error: null }),
+        maybeSingle: async () => ({ data: opts.stored, error: opts.readError ?? null }),
         then: (resolve: (v: unknown) => void) => {
           if (mode === 'probe') {
             return resolve(
@@ -81,7 +91,9 @@ function makeSupabase(opts: {
           }
           if (mode === 'update') {
             updates.push(payload!);
-            return resolve({ error: null });
+            return resolve({
+              error: updateKind === 'markChecked' ? opts.markCheckedError ?? null : opts.updateError ?? null,
+            });
           }
           return resolve({ data: opts.candidates, error: null });
         },
@@ -334,6 +346,82 @@ describe('durable unavailable and transient handling', () => {
 
     expect(log.mock.calls.flat().join('\n')).toContain('unavailable=1');
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('persistence failure diagnostics', () => {
+  it('logs an opaque bounded diagnostic for a failed mark_checked batch without changing its counter', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const invalid = { id: 'internal/server-id', github_url: 'not a GitHub URL' };
+    const h = makeSupabase({
+      candidates: [invalid],
+      stored: null,
+      markCheckedError: { code: '42501', message: 'permission denied for table servers' },
+    });
+
+    const result = await enrichWithGitHub(h.client, 'token');
+    const output = log.mock.calls.flat().join('\n');
+
+    expect(result.fatal).toBe(true);
+    expect(result.errors).toEqual(['GitHub enrichment could not persist 1 row update(s).']);
+    expect(output).toContain('operation=mark_checked');
+    expect(output).toContain('db_code=42501');
+    expect(output).toContain('db_message=permission_denied');
+    expect(output).toMatch(/row_ref=sha256:[a-f0-9]{12}/);
+    expect(output).not.toContain(invalid.id);
+    expect(h.updates).toHaveLength(1);
+  });
+
+  it('logs a select failure with an opaque row ref and preserves the existing fatal count', async () => {
+    stubGithub({});
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = makeSupabase({
+      candidates: [CANDIDATE],
+      stored: null,
+      readError: { code: 'PGRST116', message: 'The result contains 0 rows' },
+    });
+
+    const result = await enrichWithGitHub(h.client, 'token');
+    const output = log.mock.calls.flat().join('\n');
+
+    expect(result.fatal).toBe(true);
+    expect(result.errors).toEqual(['GitHub enrichment could not persist 1 row update(s).']);
+    expect(output).toContain('operation=read_current');
+    expect(output).toContain('db_code=PGRST116');
+    expect(output).toContain('db_message=database_error');
+    expect(output).toMatch(/row_ref=sha256:[a-f0-9]{12}/);
+    expect(output).not.toContain(CANDIDATE.id);
+    expect(h.updates).toHaveLength(0);
+  });
+
+  it('logs only fixed categories for an update failure, never error text or sensitive row material', async () => {
+    stubGithub({});
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const secret = 'Bearer secret-value';
+    const h = makeSupabase({
+      candidates: [CANDIDATE],
+      stored: null,
+      updateError: {
+        code: 'UNTRUSTED_CODE',
+        message: `UPDATE servers SET authorization='${secret}' WHERE id='${CANDIDATE.id}' https://db.example.test`,
+      },
+    });
+
+    const result = await enrichWithGitHub(h.client, 'token');
+    const output = log.mock.calls.flat().join('\n');
+
+    expect(result.fatal).toBe(true);
+    expect(result.errors).toEqual(['GitHub enrichment could not persist 1 row update(s).']);
+    expect(output).toContain('operation=update_enrichment');
+    expect(output).toContain('db_code=other');
+    expect(output).toContain('db_message=database_error');
+    expect(output).toMatch(/row_ref=sha256:[a-f0-9]{12}/);
+    expect(output).not.toContain(CANDIDATE.id);
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain('UPDATE servers');
+    expect(output).not.toContain('https://db.example.test');
+    expect(output.length).toBeLessThan(220); // Fixed fields keep diagnostics bounded.
+    expect(h.updates).toHaveLength(1);
   });
 });
 
