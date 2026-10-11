@@ -163,6 +163,80 @@ function renderedContentHash(fields: RenderedContent): string {
  */
 const MAX_FAILURE_RATE = 0.5;
 
+/**
+ * Persistence failures must identify the failed database operation without
+ * leaking request material. These are deliberately fixed labels: server IDs,
+ * URLs, database details, SQL, and transport errors are never logged here.
+ */
+type PersistenceOperation = 'mark_checked' | 'read_current' | 'update_enrichment';
+
+type DatabaseErrorCategory =
+  | 'permission_denied'
+  | 'constraint_violation'
+  | 'not_found'
+  | 'timeout'
+  | 'connection_failure'
+  | 'database_error';
+
+const SAFE_DATABASE_CODES = new Set([
+  '23502', // not_null_violation
+  '23503', // foreign_key_violation
+  '23505', // unique_violation
+  '23514', // check_violation
+  '40001', // serialization_failure
+  '42501', // insufficient_privilege
+  '42P01', // undefined_table
+  'PGRST116',
+  'PGRST204',
+  'PGRST205',
+]);
+
+function opaqueRowRef(rowIds: string[]): string {
+  return createHash('sha256')
+    .update(JSON.stringify(rowIds))
+    .digest('hex')
+    .slice(0, 12);
+}
+
+function errorField(error: unknown, field: 'code' | 'message'): string | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const value = (error as Record<string, unknown>)[field];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function safeDatabaseCode(error: unknown): string {
+  const code = errorField(error, 'code')?.toUpperCase();
+  return code && SAFE_DATABASE_CODES.has(code) ? code : 'other';
+}
+
+/**
+ * Return only a small fixed category, never a database-provided message. This
+ * keeps diagnostics useful while preventing logs from carrying SQL, URLs,
+ * credentials, headers, payloads, or arbitrary database response text.
+ */
+function safeDatabaseCategory(error: unknown): DatabaseErrorCategory {
+  const message = errorField(error, 'message')?.toLowerCase() ?? '';
+  if (/permission denied|row-level security|\brls\b/.test(message)) return 'permission_denied';
+  if (/not null|null value|duplicate key|foreign key|check constraint|constraint/.test(message)) {
+    return 'constraint_violation';
+  }
+  if (/relation .* does not exist|table .* does not exist|not found/.test(message)) return 'not_found';
+  if (/timed? out|timeout/.test(message)) return 'timeout';
+  if (/connection|network|econn|socket/.test(message)) return 'connection_failure';
+  return 'database_error';
+}
+
+function logPersistenceFailure(
+  operation: PersistenceOperation,
+  rowIds: string[],
+  error: unknown,
+): void {
+  console.error(
+    `[Enrichment] persistence_failure operation=${operation} row_ref=sha256:${opaqueRowRef(rowIds)} ` +
+      `db_code=${safeDatabaseCode(error)} db_message=${safeDatabaseCategory(error)}`,
+  );
+}
+
 function parseGithubUrl(raw: string): { owner: string; repo: string; key: string } | null {
   try {
     const sshMatch = raw.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i);
@@ -319,6 +393,7 @@ export async function enrichWithGitHub(
         .update({ github_checked_at: now })
         .in('id', batch.map(row => row.id));
       if (updateError) {
+        logPersistenceFailure('mark_checked', batch.map(row => row.id), updateError);
         ok = false;
         writeFailures += batch.length;
       }
@@ -442,6 +517,7 @@ export async function enrichWithGitHub(
           .eq('id', server.id)
           .maybeSingle();
         if (readError) {
+          logPersistenceFailure('read_current', [server.id], readError);
           writeFailures++;
           continue;
         }
@@ -466,8 +542,10 @@ export async function enrichWithGitHub(
         if (useCheckedAt) payload.github_checked_at = now;
         if (changed) payload.updated_at = now;
         const { error: updateError } = await supabase.from('servers').update(payload).eq('id', server.id);
-        if (updateError) writeFailures++;
-        else if (changed) enriched++;
+        if (updateError) {
+          logPersistenceFailure('update_enrichment', [server.id], updateError);
+          writeFailures++;
+        } else if (changed) enriched++;
         else unchanged++;
       }
     } catch (err) {
